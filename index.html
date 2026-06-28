@@ -562,6 +562,19 @@ function detectColumns(headers) {
   // 問題・答えが見つからなければ、先頭2列で代用
   if (!cols.q) cols.q = headers[0] ?? null;
   if (!cols.a) cols.a = headers[1] ?? null;
+
+  // 誤答選択肢カラム（任意・最大3つ）を検出する。
+  // ・「誤答1/誤答2/誤答3」のように末尾に番号があってもOK（全角数字も可）。
+  // ・見出し名の候補：誤答 / 誤答選択肢 / ダミー / 不正解 / distractor / wrong / decoy
+  // ・見つかった列を見出しの並び順で最大3つ採用（CSVに無ければ空配列＝従来動作）
+  const distractorBases = ["誤答", "誤答選択肢", "ダミー", "不正解", "distractor", "wrong", "decoy"];
+  cols.distractors = [];
+  for (const h of headers) {
+    // 末尾の番号（半角/全角）を取り除いたベース名で判定
+    const base = norm(h).replace(/[\s_\-]*[0-9０-９]+$/, "").trim();
+    if (distractorBases.includes(base)) cols.distractors.push(h);
+    if (cols.distractors.length >= 3) break;
+  }
   return cols;
 }
 
@@ -580,6 +593,10 @@ function rowsToCards(rows, cols) {
       hint:     cols.hint     ? (r[cols.hint] ?? "").toString().trim()     : "",
       note:     cols.note     ? (r[cols.note] ?? "").toString().trim()     : "",
       category: cols.category ? (r[cols.category] ?? "").toString().trim() : "",
+      // 誤答選択肢カラムがあれば、その行の空でない値を配列で持つ（無ければ空配列）
+      distractors: (cols.distractors || [])
+        .map((col) => (r[col] ?? "").toString().trim())
+        .filter((v) => v),
     });
   }
   return cards;
@@ -950,7 +967,7 @@ function renderCard() {
     $("btn-reveal").hidden = true;
     $("grade").hidden = true;
     $("btn-next").hidden = true;
-    renderChoices(backKey, back);   // 選択肢を生成（正解=back）
+    renderChoices(backKey, back, card);   // 選択肢を生成（正解=back、誤答はcardの指定を優先）
     $("choices").hidden = false;
   } else {
     // === 自己採点モード ===
@@ -973,27 +990,39 @@ function fillNote(noteText) {
 /* ----------------------------------------------------------------------
    4択：選択肢を組み立てる
    ・正解   = back（その問題の答え）
-   ・誤答択 = 他の問題の「同じ列(backKey)」の値から取得
-       - 正解と全く同一（前後の空白を除いて一致）のものは除外
-       - 重複も除外
-       - まず出題中の範囲(deck)から集め、3つに満たなければ全体(allCards)から補充
+   ・誤答択の決め方：
+       ① CSVに誤答選択肢カラムがある行は、それを優先して使う
+          （「答えを問う向き」＝backが答えのときのみ。空欄・正解と同一・重複は除外）
+       ② ①が3つに満たない行は、他の問題の答えから自動補充（従来動作）
    ---------------------------------------------------------------------- */
-function buildChoices(backKey, correctVal) {
+function buildChoices(backKey, correctVal, card) {
   const seen = new Set([correctVal.trim()]);  // 正解を最初に登録＝誤答択から除外する
   const distractors = [];
 
-  // 渡したカード集合から、未使用の値を誤答択として集める
-  const collect = (cards) => {
-    for (const c of cards) {
-      const v = (c[backKey] ?? "").toString().trim();
-      if (!v || seen.has(v)) continue;        // 空・正解と同一・重複は除外
+  // ① CSV指定の誤答選択肢（答えを問う向き=backKeyが"a"のときだけ有効）
+  if (backKey === "a" && card && card.distractors && card.distractors.length) {
+    for (const d of card.distractors) {
+      const v = (d ?? "").toString().trim();
+      if (!v || seen.has(v)) continue;          // 空・正解と同一・重複は除外
       seen.add(v);
       distractors.push(v);
+      if (distractors.length >= 3) break;
     }
-  };
+  }
 
-  collect(shuffle(state.deck));                                  // まず学習中の範囲から
-  if (distractors.length < 3) collect(shuffle(state.allCards));  // 足りなければ全体から補充
+  // ② 足りなければ、他の問題の「同じ列(backKey)」の値から自動補充
+  if (distractors.length < 3) {
+    const collect = (cards) => {
+      for (const c of cards) {
+        const v = (c[backKey] ?? "").toString().trim();
+        if (!v || seen.has(v)) continue;        // 空・正解と同一・重複は除外
+        seen.add(v);
+        distractors.push(v);
+      }
+    };
+    collect(shuffle(state.deck));                                  // まず学習中の範囲から
+    if (distractors.length < 3) collect(shuffle(state.allCards));  // それでも足りなければ全体から
+  }
 
   // 誤答択は最大3つ。正解と混ぜてシャッフル（正解の位置が偏らないように）
   const picked = distractors.slice(0, 3);
@@ -1001,9 +1030,9 @@ function buildChoices(backKey, correctVal) {
 }
 
 // 選択肢ボタンを画面に描画する
-function renderChoices(backKey, correctVal) {
+function renderChoices(backKey, correctVal, card) {
   const box = $("choices");
-  const options = buildChoices(backKey, correctVal);
+  const options = buildChoices(backKey, correctVal, card);
   box.innerHTML = "";
   options.forEach((opt, i) => {
     const btn = document.createElement("button");
