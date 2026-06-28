@@ -399,6 +399,16 @@
           </select>
         </div>
 
+        <!-- 出題範囲：過去の間違いで絞り込む（履歴がある場合に有効） -->
+        <div class="opt-row">
+          <label for="sel-scope">出題範囲</label>
+          <select id="sel-scope">
+            <option value="all">すべて</option>
+            <option value="miss">ミス：直近で不正解</option>
+            <option value="shaky">うろ覚え：直近3回に不正解あり</option>
+          </select>
+        </div>
+
         <div class="opt-row">
           <label for="sw-shuffle">問題をシャッフルする</label>
           <span class="switch">
@@ -489,7 +499,7 @@
         <!-- 間違えた問題が1問以上あるときだけ有効 -->
         <button class="btn btn-primary btn-block" id="btn-retry-wrong">間違えた問題だけ もう一周</button>
         <button class="btn btn-block" id="btn-restart">同じ範囲を 最初から</button>
-        <button class="btn btn-block" id="btn-newfile">別のファイルを読み込む</button>
+        <button class="btn btn-block" id="btn-newfile">クイズ・設定の選択に戻る</button>
       </div>
     </section>
 
@@ -524,6 +534,7 @@ const state = {
   mode: "self",     // 出題モード： "self"=自己採点(○×) / "mc"=4択
   answered: false,  // 4択モードで、この問題に解答済みかどうか
   currentDeckId: null, // 選択中のデッキ（保存済みクイズ）のID
+  currentDeck: null,   // 選択中のデッキ全体（履歴の読み書きに使用）
 };
 
 /* ----------------------------------------------------------------------
@@ -665,6 +676,7 @@ async function onParsed(rows, headers, filename) {
   const deck = {
     name, filename: filename || "",
     cards, cols, count: cards.length, createdAt: Date.now(),
+    history: {},   // 問題ごとの直近3回の正誤（キー=行インデックス, 値=[1,0,...]）
   };
 
   try {
@@ -698,19 +710,76 @@ function setNotice(msg, kind) {
    ・保存済み一覧から選んだとき／新規追加直後の両方から呼ばれる
    ---------------------------------------------------------------------- */
 function selectDeck(deck) {
+  // このデッキ全体を保持（履歴の読み書きに使う）
+  state.currentDeck = deck;
   state.allCards = deck.cards;
   state.cols = deck.cols;
   state.currentDeckId = deck.id;
 
+  // 履歴の入れ物を用意し、各カードに行インデックス(idx)を付与。
+  // idx は「デッキ内の並び順」。内容ではなく位置で問題を識別する。
+  if (!deck.history) deck.history = {};
+  deck.cards.forEach((c, i) => { c.idx = i; });
+
   setupCategoryFilter(deck.cards);
+  updateScopeCounts(deck);   // 出題範囲（ミス/うろ覚え）の該当数を表示に反映
+
   // 問題数・開始位置の初期値と上限を、このデッキの問題数に合わせる
   $("num-count").value = deck.cards.length;
   $("num-count").max = deck.cards.length;
   $("num-start").max = deck.cards.length;
+  $("sel-scope").value = "all";   // 範囲は既定で「すべて」に戻す
 
   $("options").hidden = false;
   highlightActiveDeck();
   $("options").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/* ----------------------------------------------------------------------
+   間違い記録のユーティリティ
+   ・各問題の直近3回の正誤を deck.history[idx] = [..., 1/0] で保持（末尾が最新）。
+   ・ミス     … 最新（末尾）が不正解(0)
+   ・うろ覚え … 直近3回に1回でも不正解(0)が含まれる
+   ---------------------------------------------------------------------- */
+function missState(deck, idx) {
+  const arr = (deck && deck.history && deck.history[idx]) || [];
+  return {
+    miss:  arr.length > 0 && arr[arr.length - 1] === 0,
+    shaky: arr.includes(0),
+  };
+}
+
+// 1問の回答を履歴に記録（直近3件だけ残す）→ 保存
+function recordAnswer(idx, isCorrect) {
+  const deck = state.currentDeck;
+  if (!deck || idx == null) return;
+  if (!deck.history) deck.history = {};
+  const arr = deck.history[idx] ? deck.history[idx].slice() : [];
+  arr.push(isCorrect ? 1 : 0);
+  while (arr.length > 3) arr.shift();   // 直近3件のみ保持（累積で重くならないように）
+  deck.history[idx] = arr;
+  persistCurrentDeck();
+}
+
+// 現在デッキをIndexedDBに保存（保存不可＝その場限りの場合はスキップ）
+function persistCurrentDeck() {
+  const deck = state.currentDeck;
+  if (!deck || deck.id == null) return;
+  dbUpdateDeck(deck).catch(() => {});   // 失敗は無視（致命的でないため）
+}
+
+// 出題範囲セレクトのラベルに、現在の該当数を反映
+function updateScopeCounts(deck) {
+  let miss = 0, shaky = 0;
+  for (const c of deck.cards) {
+    const st = missState(deck, c.idx);
+    if (st.miss) miss++;
+    if (st.shaky) shaky++;
+  }
+  const sel = $("sel-scope");
+  sel.options[0].text = `すべて（${deck.cards.length}問）`;
+  sel.options[1].text = `ミス：直近で不正解（${miss}問）`;
+  sel.options[2].text = `うろ覚え：直近3回に不正解あり（${shaky}問）`;
 }
 
 /* ----------------------------------------------------------------------
@@ -902,9 +971,26 @@ function shuffle(arr) {
 function startQuiz() {
   state.mode = $("sel-mode").value;   // 出題モード（self / mc）を取得
   const catVal = state.cols.category ? $("sel-cat").value : "";
+  const scope = $("sel-scope").value; // 出題範囲（all / miss / shaky）
 
   // カテゴリで絞り込み（空なら全件）
   let deck = state.allCards.filter((c) => !catVal || c.category === catVal);
+
+  // 出題範囲で絞り込み（過去の間違い履歴で限定）
+  if (scope !== "all") {
+    deck = deck.filter((c) => {
+      const st = missState(state.currentDeck, c.idx);
+      return scope === "miss" ? st.miss : st.shaky;
+    });
+  }
+
+  // 絞り込んだ結果が0問なら、開始せずに知らせる
+  if (deck.length === 0) {
+    const label = scope === "miss" ? "ミス" : scope === "shaky" ? "うろ覚え" : "対象";
+    setNotice(`「${label}」に該当する問題がありません。`, "err");
+    return;
+  }
+
   const total = deck.length;
 
   // 問題数（空・不正なら全問。最大は総数）
@@ -1069,6 +1155,7 @@ function checkChoice(btn, selectedVal, correctVal) {
   // スコア集計（自己採点モードと同じ変数を共有）
   if (isCorrect) state.correct++;
   else state.wrong.push(state.deck[state.index]);
+  recordAnswer(state.deck[state.index].idx, isCorrect);   // 間違い履歴に記録
   updateCounter();
 
   // 答え（解答＋備考）を表示する。a-text・備考は renderCard で仕込み済み。
@@ -1090,6 +1177,7 @@ function nextCard() {
 //  ・読み込み済みデータ(allCards)とオプションはそのまま残るので、すぐ再開できる
 function quitQuiz() {
   $("counter").textContent = "";
+  if (state.currentDeck) updateScopeCounts(state.currentDeck);  // 範囲の該当数を最新に
   show("start");
 }
 
@@ -1114,6 +1202,7 @@ function revealAnswer() {
 function grade(isCorrect) {
   if (isCorrect) state.correct++;
   else state.wrong.push(state.deck[state.index]);  // 間違えたカードを記録
+  recordAnswer(state.deck[state.index].idx, isCorrect);   // 間違い履歴に記録
 
   state.index++;
   if (state.index >= state.deck.length) {
@@ -1189,7 +1278,13 @@ $("btn-next").addEventListener("click", nextCard);
 $("btn-quit").addEventListener("click", quitQuiz);
 $("btn-retry-wrong").addEventListener("click", retryWrong);
 $("btn-restart").addEventListener("click", restart);
-$("btn-newfile").addEventListener("click", () => { location.reload(); });
+// 結果画面 →「クイズ・設定の選択に戻る」：スタート画面へ（範囲の該当数と一覧を更新）
+$("btn-newfile").addEventListener("click", () => {
+  if (state.currentDeck) updateScopeCounts(state.currentDeck);
+  refreshLibrary();
+  $("counter").textContent = "";
+  show("start");
+});
 
 // キーボード操作（PC向け）
 document.addEventListener("keydown", (e) => {
