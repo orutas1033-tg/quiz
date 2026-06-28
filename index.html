@@ -1,0 +1,1207 @@
+<!doctype html>
+<!--
+  ============================================================================
+  一問一答クイズアプリ（Phase 1+2：ブラウザで動く版）
+  ----------------------------------------------------------------------------
+  ・CSV / Excel(.xlsx,.xls) を読み込み、2つのモードで一問一答を出題します。
+      - 自己採点モード：問題 → 答えを見る → ○×で自己採点
+      - 4択モード    ：問題 → 4つの選択肢から選ぶ（誤答択は他問の答えから自動生成）
+  ・このHTML1ファイルだけで完結します（追加インストール不要）。
+  ・読み込んだファイルの中身は、すべてあなたのブラウザ内だけで処理され、
+    外部サーバーには一切送信されません。
+  ----------------------------------------------------------------------------
+  使い方の概要：
+    1) このファイルをダブルクリック → 既定ブラウザで開く
+    2) CSV か xlsx を選ぶ
+    3) オプション（シャッフル等）を選んで「開始」
+  ----------------------------------------------------------------------------
+  ※ 解析ライブラリ（PapaParse / SheetJS）は lib/ に同梱しており、
+     サービスワーカー(sw.js)が全ファイルをキャッシュするため、
+     一度オンラインで開けば、以後はオフラインでも起動できます。
+  ============================================================================
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>一問一答クイズ</title>
+
+<!-- ===== PWA設定（ホーム画面に追加・オフライン起動） ===== -->
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#2F6F5E">
+<!-- iOS（Safari）でホーム画面アプリとして動かすための指定 -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="一問一答">
+<link rel="apple-touch-icon" href="./apple-touch-icon.png">
+
+<!-- 解析ライブラリ（アプリに同梱＝オフラインでも動作） -->
+<script src="./papaparse.min.js"></script>   <!-- CSV解析（PapaParse） -->
+<script src="./xlsx.full.min.js"></script>   <!-- Excel解析（SheetJS / xlsx） -->
+
+<style>
+  /* ====================================================================
+     デザイントークン（色・余白などの共通変数）
+     ・「学習スリップ／研究ノート」を意識した、落ち着いた集中向けの配色。
+     ・主役色は深い常緑(evergreen)。○は緑、×はコーラル＝機能色として使用。
+     ==================================================================== */
+  :root {
+    --paper:   #E9ECEA;   /* 背景：わずかに緑みのある淡いグレー */
+    --card:    #FCFCFB;   /* カード面：ほぼ白 */
+    --ink:     #1B231F;   /* 文字：緑みの濃いほぼ黒 */
+    --muted:   #6B736E;   /* 補助テキスト */
+    --line:    #D7DBD6;   /* ヘアライン（細い境界線） */
+    --brand:   #2F6F5E;   /* 主役のアクセント：深い常緑 */
+    --ok:      #2E7D57;   /* ○：正解 */
+    --ng:      #C25B49;   /* ×：不正解 */
+    --shadow:  0 1px 2px rgba(27,35,31,.06), 0 8px 24px rgba(27,35,31,.08);
+
+    /* 文字組み：Web フォントに依存せずオフラインでも崩れない日本語スタック。
+       数字・ラベルだけ等幅にして「研究ノート」的な質感を出す（=このアプリの署名）。 */
+    --font-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+                 "Yu Gothic", "Noto Sans JP", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  /* ベースのリセットと全体レイアウト */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    line-height: 1.7;
+    /* iPhone のノッチ／ホームバーを避けるための安全領域パディング */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 画面中央に最大520pxで配置（PC・スマホ共通の1カラム） */
+  .wrap {
+    max-width: 520px;
+    margin: 0 auto;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    padding: 20px 18px 28px;
+  }
+
+  /* ---- ヘッダー（アプリ名＋進捗カウンター） ---- */
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 22px;
+  }
+  .title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: .04em;
+  }
+  .title .dot { color: var(--brand); }
+  /* 進捗カウンターは等幅フォント（ノート的な質感の署名要素） */
+  .counter {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: .06em;
+    white-space: nowrap;
+  }
+
+  main { flex: 1; display: flex; flex-direction: column; }
+
+  /* ====================================================================
+     画面（スタート / クイズ / 結果）の切り替え
+     ・.screen に hidden 属性を付け外しして表示を制御します。
+     ==================================================================== */
+  .screen[hidden] { display: none; }
+  .screen { display: flex; flex-direction: column; flex: 1; }
+
+  /* ---- 小さなラベル（等幅・うっすら見出し） ---- */
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--brand);
+    margin: 0 0 10px;
+  }
+
+  /* ---- ファイル読み込みエリア ---- */
+  .lead { font-size: 14px; color: var(--muted); margin: 0 0 20px; }
+
+  .drop {
+    border: 1.5px dashed var(--line);
+    border-radius: 14px;
+    background: var(--card);
+    padding: 26px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .drop:hover, .drop.is-over { border-color: var(--brand); background: #fff; }
+  .drop strong { display: block; font-size: 15px; margin-bottom: 4px; }
+  .drop span   { font-size: 12.5px; color: var(--muted); }
+  .drop input  { display: none; }  /* 実体の<input type=file>は隠してラベルで装飾 */
+
+  /* 読み込み結果のメッセージ（成功／エラー共通の置き場所） */
+  .notice { margin-top: 14px; font-size: 13px; min-height: 1.2em; }
+  .notice.ok  { color: var(--brand); }
+  .notice.err { color: var(--ng); }
+
+  /* ---- 保存済みクイズ一覧（デッキ） ---- */
+  #deck-list { display: grid; gap: 10px; }
+  .deck-empty { font-size: 13px; color: var(--muted); margin: 2px 0; }
+  .deck {
+    display: flex; align-items: stretch;
+    border: 1px solid var(--line); border-radius: 12px;
+    background: var(--card); overflow: hidden;
+  }
+  .deck.is-active { border-color: var(--brand); }
+  /* デッキ名（タップで選択） */
+  .deck-main {
+    flex: 1; text-align: left; background: none; border: none; cursor: pointer;
+    padding: 13px 14px; display: flex; flex-direction: column; gap: 3px;
+    color: var(--ink); font: inherit;
+  }
+  .deck-main:hover { background: #f3f6f4; }
+  .deck.is-active .deck-main { background: #eef7f1; }
+  .deck-name { font-size: 15px; font-weight: 600; }
+  .deck-meta { font-family: var(--font-mono); font-size: 11px; color: var(--muted); letter-spacing: .04em; }
+  /* 右側の操作（名前変更・削除）を縦に */
+  .deck-actions { display: flex; flex-direction: column; flex: none; }
+  .deck-actions button {
+    flex: 1; min-width: 60px; border: none; border-left: 1px solid var(--line);
+    background: none; font: inherit; font-size: 12px; color: var(--muted);
+    cursor: pointer; padding: 0 12px;
+  }
+  .deck-rename { border-bottom: 1px solid var(--line); }
+  .deck-rename:hover { background: #f3f6f4; color: var(--ink); }
+  .deck-del:hover { background: #fbf1ef; color: var(--ng); }
+
+  /* ---- オプション（シャッフル・向き・カテゴリ） ---- */
+  .options { margin-top: 22px; display: grid; gap: 14px; }
+  .options[hidden] { display: none; }
+  .opt-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .opt-row label { font-size: 14px; }
+  .opt-row .hint { font-size: 12px; color: var(--muted); }
+  select, .switch select { font: inherit; }
+  select {
+    font-size: 14px; padding: 7px 10px; border: 1px solid var(--line);
+    border-radius: 9px; background: var(--card); color: var(--ink);
+  }
+  /* トグルスイッチ（チェックボックスを装飾） */
+  .switch { position: relative; width: 46px; height: 27px; flex: none; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .track {
+    position: absolute; inset: 0; border-radius: 999px;
+    background: var(--line); transition: background .15s ease;
+  }
+  .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px;
+    width: 21px; height: 21px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 2px rgba(0,0,0,.2); transition: transform .15s ease;
+  }
+  .switch input:checked + .track { background: var(--brand); }
+  .switch input:checked + .track::after { transform: translateX(19px); }
+  .switch input:focus-visible + .track { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+  /* ====================================================================
+     ボタン
+     ==================================================================== */
+  .btn {
+    font: inherit; font-size: 15px; font-weight: 600;
+    border: 1px solid var(--line); border-radius: 11px;
+    padding: 13px 18px; background: var(--card); color: var(--ink);
+    cursor: pointer; transition: transform .04s ease, background .15s ease, border-color .15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  .btn[disabled] { opacity: .45; cursor: not-allowed; }
+  .btn-primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .btn-primary:hover { background: #28604f; }
+  .btn-block { width: 100%; }
+
+  /* ---- クイズ：カード本体（このアプリの主役） ---- */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+    padding: 30px 24px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 300px;
+  }
+  .card .tag {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em;
+    color: var(--muted); margin-bottom: 16px; text-transform: uppercase;
+  }
+  /* 問題文：大きめ・少し詰めた行間で「主役」に */
+  .question {
+    font-size: 23px; font-weight: 600; line-height: 1.55;
+    letter-spacing: .01em; white-space: pre-wrap; word-break: break-word;
+    margin: 0;
+  }
+  .hint {
+    margin-top: 14px; font-size: 13px; color: var(--muted);
+  }
+
+  /* 解答エリア：はじめは隠し、「答えを見る」で開く（=署名となる reveal の瞬間） */
+  .answer-box {
+    margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--line);
+  }
+  .answer-box[hidden] { display: none; }
+  .answer-label {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em;
+    color: var(--brand); text-transform: uppercase; margin-bottom: 8px;
+  }
+  .answer {
+    font-size: 19px; line-height: 1.6; white-space: pre-wrap;
+    word-break: break-word; margin: 0;
+    animation: rise .22s ease;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* ---- クイズ：下部の操作ボタン ---- */
+  .actions { margin-top: 18px; display: grid; gap: 10px; }
+  .grade { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grade[hidden] { display: none; }
+  .btn-ng { color: var(--ng); border-color: #e6c4bd; }
+  .btn-ng:hover { background: #fbf1ef; }
+  .btn-ok { color: var(--ok); border-color: #bcd9c9; }
+  .btn-ok:hover { background: #eef7f1; }
+
+  /* ---- クイズ：4択モードの選択肢 ---- */
+  .choices {
+    margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--line);
+    display: grid; gap: 10px;
+  }
+  .choices[hidden] { display: none; }
+  .choice {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    text-align: left; font: inherit; font-size: 15.5px; line-height: 1.45;
+    padding: 13px 14px; border: 1px solid var(--line); border-radius: 11px;
+    background: var(--card); color: var(--ink); cursor: pointer;
+    transition: border-color .12s ease, background .12s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .choice:hover:not(:disabled) { border-color: var(--brand); }
+  .choice:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  .choice:disabled { cursor: default; }
+  /* 番号バッジ（キーボードの 1〜4 に対応） */
+  .choice .num {
+    flex: none; width: 22px; height: 22px; border-radius: 6px;
+    display: grid; place-items: center; font-family: var(--font-mono);
+    font-size: 12px; color: var(--muted); background: var(--paper);
+  }
+  /* 採点後の色付け：正解＝緑、選んだ誤答＝赤 */
+  .choice.is-correct { border-color: var(--ok); background: #eef7f1; color: var(--ok); }
+  .choice.is-correct .num { background: var(--ok); color: #fff; }
+  .choice.is-wrong { border-color: var(--ng); background: #fbf1ef; color: var(--ng); }
+  .choice.is-wrong .num { background: var(--ng); color: #fff; }
+
+  /* 数値入力（問題数・開始位置） */
+  input[type="number"] {
+    font: inherit; font-size: 14px; width: 92px; padding: 7px 10px;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--card); color: var(--ink);
+  }
+  input[type="number"]:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+  /* 備考欄（解答の下に表示） */
+  .note { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--line); }
+  .note[hidden] { display: none; }
+  .note-label {
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em;
+    color: var(--muted); text-transform: uppercase; margin-bottom: 6px;
+  }
+  .note-text {
+    font-size: 14px; color: var(--muted); line-height: 1.65; margin: 0;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* ---- 結果画面 ---- */
+  .result-num {
+    font-family: var(--font-mono); font-size: 46px; font-weight: 600;
+    color: var(--brand); letter-spacing: -.02em; margin: 6px 0 2px;
+  }
+  .result-sub { font-size: 14px; color: var(--muted); margin: 0 0 26px; }
+  .result-actions { display: grid; gap: 10px; margin-top: auto; }
+
+  /* 控えめな「やめる」ボタン（主要操作の邪魔をしない見た目） */
+  .btn-quiet {
+    margin-top: 14px; align-self: center;
+    font: inherit; font-size: 13px; color: var(--muted);
+    background: none; border: none; cursor: pointer; padding: 8px 12px;
+    text-decoration: underline; text-underline-offset: 3px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn-quiet:hover { color: var(--ink); }
+  .btn-quiet:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 6px; }
+
+  /* アクセシビリティ：モーション軽減設定を尊重 */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+
+<body>
+<div class="wrap">
+
+  <!-- ===== ヘッダー ===== -->
+  <header>
+    <div class="title">一問一答<span class="dot">・</span>クイズ</div>
+    <div class="counter" id="counter"></div>
+  </header>
+
+  <main>
+
+    <!-- ============================================================
+         画面1：スタート（ファイル読み込み＋オプション）
+         ============================================================ -->
+    <section class="screen" id="screen-start">
+      <!-- 保存済みクイズ（IndexedDBに保存したデッキ一覧） -->
+      <p class="eyebrow">保存済みクイズ</p>
+      <div id="deck-list"></div>
+
+      <!-- 新しいファイルの追加 -->
+      <p class="eyebrow" style="margin-top:24px;">CSV / Excel を追加</p>
+      <p class="lead">問題と答えが入った CSV か Excel(.xlsx) を選ぶと、保存して使えるようになります。1行目は見出し行にしてください。</p>
+
+      <!-- ファイル選択（label で input[type=file] を装飾）。ドラッグ&ドロップにも対応 -->
+      <label class="drop" id="drop">
+        <strong>ファイルを選ぶ</strong>
+        <span>クリックで選択／ここにドラッグ&ドロップ</span>
+        <input type="file" id="file" accept=".csv,.tsv,.txt,.xlsx,.xls">
+      </label>
+
+      <div class="notice" id="notice"></div>
+
+      <!-- デッキ選択後にだけ表示されるオプション群 -->
+      <div class="options" id="options" hidden>
+        <p class="eyebrow" style="margin-top:6px;">出題の設定</p>
+
+        <div class="opt-row">
+          <label for="sel-mode">出題モード</label>
+          <select id="sel-mode">
+            <option value="self">自己採点（○×）</option>
+            <option value="mc">4択クイズ</option>
+          </select>
+        </div>
+
+        <div class="opt-row">
+          <label for="sw-shuffle">問題をシャッフルする</label>
+          <span class="switch">
+            <input type="checkbox" id="sw-shuffle" checked>
+            <span class="track"></span>
+          </span>
+        </div>
+
+        <!-- 順番モード（シャッフルOFF）のときだけ表示：何番目から始めるか -->
+        <div class="opt-row" id="start-row" hidden>
+          <label for="num-start">何番目から</label>
+          <input type="number" id="num-start" min="1" value="1">
+        </div>
+
+        <!-- 出題する問題数（空なら全問） -->
+        <div class="opt-row">
+          <label for="num-count">問題数</label>
+          <input type="number" id="num-count" min="1">
+        </div>
+
+        <div class="opt-row">
+          <label for="sel-dir">出題の向き</label>
+          <select id="sel-dir">
+            <option value="qa">問題 → 答え</option>
+            <option value="aq">答え → 問題</option>
+            <option value="rand">毎回ランダム</option>
+          </select>
+        </div>
+
+        <!-- カテゴリ列が存在するときだけ表示される絞り込み -->
+        <div class="opt-row" id="cat-row" hidden>
+          <label for="sel-cat">カテゴリで絞り込み</label>
+          <select id="sel-cat"></select>
+        </div>
+
+        <button class="btn btn-primary btn-block" id="btn-start" style="margin-top:6px;">開始する</button>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         画面2：クイズ
+         ============================================================ -->
+    <section class="screen" id="screen-quiz" hidden>
+      <div class="card">
+        <div class="tag" id="quiz-tag"></div>
+        <p class="question" id="q-text"></p>
+        <div class="hint" id="q-hint" hidden></div>
+
+        <!-- 選択肢エリア（4択モードで使用：JSで動的に生成） -->
+        <div class="choices" id="choices" hidden></div>
+
+        <!-- 解答エリア（両モード共通：答え＋備考。最初は隠れている） -->
+        <div class="answer-box" id="answer-box" hidden>
+          <div class="answer-label">解答</div>
+          <p class="answer" id="a-text"></p>
+          <!-- 備考欄（CSVに備考列があるときだけ表示） -->
+          <div class="note" id="note-box" hidden>
+            <div class="note-label">備考</div>
+            <p class="note-text" id="note-text"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <!-- 自己採点モード：「答えを見る」→ ○×ボタンに切り替わる -->
+        <button class="btn btn-primary btn-block" id="btn-reveal">答えを見る</button>
+        <div class="grade" id="grade" hidden>
+          <button class="btn btn-ng" id="btn-ng">× できなかった</button>
+          <button class="btn btn-ok" id="btn-ok">○ できた</button>
+        </div>
+        <!-- 4択モード：選択肢を選んだ後に表示される「次へ」 -->
+        <button class="btn btn-primary btn-block" id="btn-next" hidden>次へ</button>
+      </div>
+
+      <!-- 回答を中断してスタート画面（ファイル選択）に戻る -->
+      <button class="btn-quiet" id="btn-quit">やめる</button>
+    </section>
+
+    <!-- ============================================================
+         画面3：結果
+         ============================================================ -->
+    <section class="screen" id="screen-result" hidden>
+      <p class="eyebrow">RESULT — おつかれさまでした</p>
+      <div class="result-num" id="r-score"></div>
+      <p class="result-sub" id="r-sub"></p>
+
+      <div class="result-actions">
+        <!-- 間違えた問題が1問以上あるときだけ有効 -->
+        <button class="btn btn-primary btn-block" id="btn-retry-wrong">間違えた問題だけ もう一周</button>
+        <button class="btn btn-block" id="btn-restart">同じ範囲を 最初から</button>
+        <button class="btn btn-block" id="btn-newfile">別のファイルを読み込む</button>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+/* ======================================================================
+   アプリのロジック
+   ----------------------------------------------------------------------
+   全体の状態は state オブジェクトに集約します（研究コードでいう
+   「設定・データ・進捗」をまとめた dict のイメージ）。
+   ====================================================================== */
+"use strict";
+
+// --- 画面・部品の参照をまとめて取得（毎回 getElementById を書かずに済む） ---
+const $ = (id) => document.getElementById(id);
+const screens = {
+  start:  $("screen-start"),
+  quiz:   $("screen-quiz"),
+  result: $("screen-result"),
+};
+
+// アプリ全体の状態
+const state = {
+  allCards: [],     // 読み込んだ全カード（{q, a, hint, category} の配列）
+  deck: [],         // 今回の出題対象（フィルタ・シャッフル後）
+  index: 0,         // 何問目か（0始まり）
+  correct: 0,       // 正解数
+  wrong: [],        // 間違えたカードの配列（あとで再出題に使う）
+  cols: null,       // 検出した列名 {q, a, hint, category}
+  mode: "self",     // 出題モード： "self"=自己採点(○×) / "mc"=4択
+  answered: false,  // 4択モードで、この問題に解答済みかどうか
+  currentDeckId: null, // 選択中のデッキ（保存済みクイズ）のID
+};
+
+/* ----------------------------------------------------------------------
+   画面切り替え：指定した画面だけ表示する
+   ---------------------------------------------------------------------- */
+function show(name) {
+  for (const key in screens) screens[key].hidden = (key !== name);
+}
+
+/* ----------------------------------------------------------------------
+   列名の自動検出
+   ・日本語/英語のよくある見出し名から、問題・答え・カテゴリ・ヒント列を推定。
+   ・見つからなければ「左から1列目=問題、2列目=答え」を採用。
+   ---------------------------------------------------------------------- */
+function detectColumns(headers) {
+  // 候補リスト（小文字・空白除去して比較）
+  // ・hint … 問題と一緒に出す「ヒント」
+  // ・note … 答えの下に出す「備考」（補足/解説/メモなどはこちら）
+  const cand = {
+    q:        ["question", "問題", "問", "質問", "q", "front", "表", "用語", "term"],
+    a:        ["answer", "答え", "解答", "回答", "a", "back", "裏", "意味", "定義"],
+    hint:     ["hint", "ヒント"],
+    note:     ["備考", "remarks", "remark", "解説", "コメント", "comment", "note", "補足", "メモ"],
+    category: ["category", "カテゴリ", "カテゴリー", "分類", "章", "section", "tag", "タグ"],
+  };
+  const norm = (s) => String(s).trim().toLowerCase();
+  const find = (list) => headers.find((h) => list.includes(norm(h))) || null;
+
+  const cols = {
+    q:        find(cand.q),
+    a:        find(cand.a),
+    hint:     find(cand.hint),
+    note:     find(cand.note),
+    category: find(cand.category),
+  };
+  // 問題・答えが見つからなければ、先頭2列で代用
+  if (!cols.q) cols.q = headers[0] ?? null;
+  if (!cols.a) cols.a = headers[1] ?? null;
+  return cols;
+}
+
+/* ----------------------------------------------------------------------
+   行データ（オブジェクト配列）→ カード配列へ変換
+   ・問題・答えが両方とも空でない行だけを採用。
+   ---------------------------------------------------------------------- */
+function rowsToCards(rows, cols) {
+  const cards = [];
+  for (const r of rows) {
+    const q = (r[cols.q] ?? "").toString().trim();
+    const a = (r[cols.a] ?? "").toString().trim();
+    if (!q || !a) continue;  // 空行・不完全な行はスキップ
+    cards.push({
+      q, a,
+      hint:     cols.hint     ? (r[cols.hint] ?? "").toString().trim()     : "",
+      note:     cols.note     ? (r[cols.note] ?? "").toString().trim()     : "",
+      category: cols.category ? (r[cols.category] ?? "").toString().trim() : "",
+    });
+  }
+  return cards;
+}
+
+/* ----------------------------------------------------------------------
+   ファイル読み込みの入口（拡張子で CSV / Excel を振り分け）
+   ---------------------------------------------------------------------- */
+function handleFile(file) {
+  const name = file.name.toLowerCase();
+  const notice = $("notice");
+  notice.className = "notice";
+  notice.textContent = "読み込み中…";
+
+  if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+    readExcel(file);
+  } else {
+    readCsv(file);  // .csv / .tsv / .txt はCSV扱い
+  }
+}
+
+// --- CSV/TSV を PapaParse で解析 ---
+function readCsv(file) {
+  Papa.parse(file, {
+    header: true,          // 1行目を見出しとして扱う
+    skipEmptyLines: true,
+    complete: (res) => {
+      if (!res.data || res.data.length === 0) {
+        return fail("データが空でした。1行目に見出し、2行目以降にデータを入れてください。");
+      }
+      const headers = res.meta.fields || Object.keys(res.data[0]);
+      onParsed(res.data, headers, file.name);
+    },
+    error: () => fail("CSVの読み込みに失敗しました。文字コードはUTF-8がおすすめです。"),
+  });
+}
+
+// --- Excel を SheetJS で解析（先頭シートを使用） ---
+function readExcel(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];          // 先頭シート
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" }); // 1行目を見出しに
+      if (rows.length === 0) return fail("シートにデータがありませんでした。");
+      const headers = Object.keys(rows[0]);
+      onParsed(rows, headers, file.name);
+    } catch (err) {
+      fail("Excelの読み込みに失敗しました。別のファイルでお試しください。");
+    }
+  };
+  reader.onerror = () => fail("ファイルを開けませんでした。");
+  reader.readAsArrayBuffer(file);
+}
+
+// --- 解析後の共通処理：列検出→カード化→デッキとして保存→選択 ---
+async function onParsed(rows, headers, filename) {
+  const cols = detectColumns(headers);
+  const cards = rowsToCards(rows, cols);
+  if (cards.length === 0) {
+    return fail("問題・答えのペアが見つかりませんでした。見出し名（例：問題 / 答え）をご確認ください。");
+  }
+  // デッキ名は拡張子を除いたファイル名（無ければ汎用名）
+  const name = (filename || "クイズ").replace(/\.(csv|tsv|txt|xlsx|xls)$/i, "") || "クイズ";
+  const deck = {
+    name, filename: filename || "",
+    cards, cols, count: cards.length, createdAt: Date.now(),
+  };
+
+  try {
+    deck.id = await dbAddDeck(deck);   // IndexedDBに保存（idが採番される）
+    await refreshLibrary();
+    selectDeck(deck);
+    setNotice(`「${name}」を保存しました（${cards.length}問）。`, "ok");
+  } catch (e) {
+    // IndexedDBが使えない環境では保存をあきらめ、その場限りで使えるようにする
+    deck.id = null;
+    selectDeck(deck);
+    setNotice(`${cards.length}問を読み込みました（この端末では保存できませんでした）。`, "ok");
+  }
+}
+
+// --- 読み込み失敗時の共通処理 ---
+function fail(msg) {
+  setNotice(msg, "err");
+  $("options").hidden = true;
+}
+
+// メッセージ表示の共通関数
+function setNotice(msg, kind) {
+  const notice = $("notice");
+  notice.className = "notice" + (kind ? " " + kind : "");
+  notice.textContent = msg;
+}
+
+/* ----------------------------------------------------------------------
+   デッキを選択して出題設定（オプション）を表示する
+   ・保存済み一覧から選んだとき／新規追加直後の両方から呼ばれる
+   ---------------------------------------------------------------------- */
+function selectDeck(deck) {
+  state.allCards = deck.cards;
+  state.cols = deck.cols;
+  state.currentDeckId = deck.id;
+
+  setupCategoryFilter(deck.cards);
+  // 問題数・開始位置の初期値と上限を、このデッキの問題数に合わせる
+  $("num-count").value = deck.cards.length;
+  $("num-count").max = deck.cards.length;
+  $("num-start").max = deck.cards.length;
+
+  $("options").hidden = false;
+  highlightActiveDeck();
+  $("options").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/* ----------------------------------------------------------------------
+   カテゴリ絞り込みの準備（カテゴリ列がある場合のみ）
+   ---------------------------------------------------------------------- */
+function setupCategoryFilter(cards) {
+  const row = $("cat-row");
+  const sel = $("sel-cat");
+  const cats = [...new Set(cards.map((c) => c.category).filter(Boolean))];
+  if (!state.cols.category || cats.length === 0) {
+    row.hidden = true;       // カテゴリが無ければ非表示
+    return;
+  }
+  sel.innerHTML = '<option value="">すべて</option>' +
+    cats.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  row.hidden = false;
+}
+
+// HTMLエスケープ（カテゴリ名などを安全に表示するため）
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (m) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
+/* ======================================================================
+   IndexedDB（保存済みクイズ＝デッキの保存先）
+   ----------------------------------------------------------------------
+   ・データベース名 "quizApp"、オブジェクトストア "decks"。
+   ・各デッキ ＝ {id, name, filename, cards, cols, count, createdAt}。
+   ・id は自動採番（autoIncrement）。
+   ・研究のデータ保存と同じで「キーで1件ずつ出し入れする小さなDB」のイメージ。
+   ====================================================================== */
+const DB_NAME = "quizApp";
+const DB_VERSION = 1;
+const STORE = "decks";
+
+// DBを開く（無ければ作る）。Promiseで扱いやすくする。
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        db.createObjectStore(STORE, { keyPath: "id", autoIncrement: true });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// デッキを1件追加 → 採番された id を返す
+function dbAddDeck(deck) {
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).add(deck);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// 全デッキを取得
+function dbGetAllDecks() {
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readonly").objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// デッキを1件削除
+function dbDeleteDeck(id) {
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// デッキを上書き保存（名前変更などに使用）
+function dbUpdateDeck(deck) {
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).put(deck);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+/* ----------------------------------------------------------------------
+   保存済みクイズ一覧の描画
+   ---------------------------------------------------------------------- */
+async function refreshLibrary() {
+  const list = $("deck-list");
+  let decks = [];
+  try { decks = await dbGetAllDecks(); }
+  catch (e) {
+    list.innerHTML = '<p class="deck-empty">この端末では保存機能が使えません（追加したクイズはその場限りになります）。</p>';
+    return;
+  }
+
+  list.innerHTML = "";
+  if (decks.length === 0) {
+    list.innerHTML = '<p class="deck-empty">まだ保存されたクイズはありません。下から追加してください。</p>';
+    return;
+  }
+
+  // 新しい順に並べる
+  decks.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+  for (const d of decks) {
+    const ext = (d.filename || "").toLowerCase().match(/\.(xlsx|xls)$/) ? "Excel" : "CSV";
+
+    const row = document.createElement("div");
+    row.className = "deck";
+    row.dataset.id = d.id;
+
+    // 本体（タップで選択）
+    const main = document.createElement("button");
+    main.className = "deck-main";
+    const nm = document.createElement("span");
+    nm.className = "deck-name"; nm.textContent = d.name;
+    const meta = document.createElement("span");
+    meta.className = "deck-meta"; meta.textContent = `${d.count}問 ・ ${ext}`;
+    main.append(nm, meta);
+    main.addEventListener("click", () => selectDeck(d));
+
+    // 操作（名前変更・削除）
+    const actions = document.createElement("div");
+    actions.className = "deck-actions";
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "deck-rename"; renameBtn.textContent = "名前";
+    renameBtn.addEventListener("click", () => renameDeck(d));
+    const delBtn = document.createElement("button");
+    delBtn.className = "deck-del"; delBtn.textContent = "削除";
+    delBtn.addEventListener("click", () => deleteDeck(d));
+    actions.append(renameBtn, delBtn);
+
+    row.append(main, actions);
+    list.appendChild(row);
+  }
+  highlightActiveDeck();
+}
+
+// 選択中のデッキに枠線を付ける
+function highlightActiveDeck() {
+  document.querySelectorAll("#deck-list .deck").forEach((el) => {
+    el.classList.toggle("is-active", String(state.currentDeckId) === el.dataset.id);
+  });
+}
+
+// デッキの名前変更
+async function renameDeck(deck) {
+  const next = prompt("クイズの名前を変更します。", deck.name);
+  if (next === null) return;                 // キャンセル
+  const name = next.trim();
+  if (!name) return;
+  deck.name = name;
+  try { await dbUpdateDeck(deck); } catch (e) {}
+  await refreshLibrary();
+}
+
+// デッキの削除（確認あり）
+async function deleteDeck(deck) {
+  if (!confirm(`「${deck.name}」を削除します。よろしいですか？`)) return;
+  try { await dbDeleteDeck(deck.id); } catch (e) {}
+  // 選択中のものを消したら、オプションを閉じる
+  if (state.currentDeckId === deck.id) {
+    state.currentDeckId = null;
+    $("options").hidden = true;
+  }
+  await refreshLibrary();
+  setNotice(`「${deck.name}」を削除しました。`, "ok");
+}
+
+/* ----------------------------------------------------------------------
+   配列をシャッフル（Fisher–Yates法：偏りのない定番アルゴリズム）
+   ---------------------------------------------------------------------- */
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* ----------------------------------------------------------------------
+   出題開始：オプションを読み取り、デッキ（出題対象）を組み立てる
+   ---------------------------------------------------------------------- */
+function startQuiz() {
+  state.mode = $("sel-mode").value;   // 出題モード（self / mc）を取得
+  const catVal = state.cols.category ? $("sel-cat").value : "";
+
+  // カテゴリで絞り込み（空なら全件）
+  let deck = state.allCards.filter((c) => !catVal || c.category === catVal);
+  const total = deck.length;
+
+  // 問題数（空・不正なら全問。最大は総数）
+  let count = parseInt($("num-count").value, 10);
+  if (!Number.isFinite(count) || count < 1) count = total;
+  count = Math.min(count, total);
+
+  if ($("sw-shuffle").checked) {
+    // ランダム：シャッフルして先頭から count 問
+    deck = shuffle(deck).slice(0, count);
+  } else {
+    // 順番：開始位置（1始まり）から count 問
+    let start = parseInt($("num-start").value, 10);
+    if (!Number.isFinite(start) || start < 1) start = 1;
+    start = Math.min(start, total);
+    deck = deck.slice(start - 1, start - 1 + count);
+  }
+
+  state.deck = deck;
+  state.index = 0;
+  state.correct = 0;
+  state.wrong = [];
+  show("quiz");
+  renderCard();
+}
+
+/* ----------------------------------------------------------------------
+   現在のカードを表示する
+   ・出題の向き（問題→答え / 答え→問題 / ランダム）をここで反映。
+   ---------------------------------------------------------------------- */
+function renderCard() {
+  const card = state.deck[state.index];
+
+  // 出題の向きを決定（randなら1問ごとにコイントス）
+  // backKey は「答えにあたる列」が q か a かを表す（4択の誤答択を集めるのに使う）
+  const dir = $("sel-dir").value;
+  let front = card.q, back = card.a, backKey = "a";
+  if (dir === "aq" || (dir === "rand" && Math.random() < 0.5)) {
+    front = card.a; back = card.q; backKey = "q";
+  }
+
+  // カテゴリ＋ヒントのタグ表示
+  $("quiz-tag").textContent = card.category ? `［${card.category}］` : "問題";
+  $("q-text").textContent = front;
+
+  const hintEl = $("q-hint");
+  if (card.hint) { hintEl.hidden = false; hintEl.textContent = "ヒント： " + card.hint; }
+  else           { hintEl.hidden = true; }
+
+  state.answered = false;
+
+  // 解答エリアの中身（答え＋備考）を仕込んでおき、いったん隠す。
+  // 表示は、自己採点なら「答えを見る」、4択なら選択した時点で行う。
+  $("a-text").textContent = back;
+  fillNote(card.note);
+  $("answer-box").hidden = true;
+
+  if (state.mode === "mc") {
+    // === 4択モード ===
+    $("btn-reveal").hidden = true;
+    $("grade").hidden = true;
+    $("btn-next").hidden = true;
+    renderChoices(backKey, back);   // 選択肢を生成（正解=back）
+    $("choices").hidden = false;
+  } else {
+    // === 自己採点モード ===
+    $("choices").hidden = true;
+    $("btn-next").hidden = true;
+    $("btn-reveal").hidden = false;
+    $("grade").hidden = true;
+  }
+
+  updateCounter();
+}
+
+// 備考欄の表示／非表示を切り替える（備考が空なら隠す）
+function fillNote(noteText) {
+  const box = $("note-box");
+  if (noteText) { box.hidden = false; $("note-text").textContent = noteText; }
+  else          { box.hidden = true; }
+}
+
+/* ----------------------------------------------------------------------
+   4択：選択肢を組み立てる
+   ・正解   = back（その問題の答え）
+   ・誤答択 = 他の問題の「同じ列(backKey)」の値から取得
+       - 正解と全く同一（前後の空白を除いて一致）のものは除外
+       - 重複も除外
+       - まず出題中の範囲(deck)から集め、3つに満たなければ全体(allCards)から補充
+   ---------------------------------------------------------------------- */
+function buildChoices(backKey, correctVal) {
+  const seen = new Set([correctVal.trim()]);  // 正解を最初に登録＝誤答択から除外する
+  const distractors = [];
+
+  // 渡したカード集合から、未使用の値を誤答択として集める
+  const collect = (cards) => {
+    for (const c of cards) {
+      const v = (c[backKey] ?? "").toString().trim();
+      if (!v || seen.has(v)) continue;        // 空・正解と同一・重複は除外
+      seen.add(v);
+      distractors.push(v);
+    }
+  };
+
+  collect(shuffle(state.deck));                                  // まず学習中の範囲から
+  if (distractors.length < 3) collect(shuffle(state.allCards));  // 足りなければ全体から補充
+
+  // 誤答択は最大3つ。正解と混ぜてシャッフル（正解の位置が偏らないように）
+  const picked = distractors.slice(0, 3);
+  return shuffle([correctVal, ...picked]);
+}
+
+// 選択肢ボタンを画面に描画する
+function renderChoices(backKey, correctVal) {
+  const box = $("choices");
+  const options = buildChoices(backKey, correctVal);
+  box.innerHTML = "";
+  options.forEach((opt, i) => {
+    const btn = document.createElement("button");
+    btn.className = "choice";
+    btn.dataset.value = opt;
+    // 番号バッジ（1〜4）＋選択肢テキスト。textContentで安全に挿入。
+    const num = document.createElement("span");
+    num.className = "num";
+    num.textContent = String(i + 1);
+    const label = document.createElement("span");
+    label.textContent = opt;
+    btn.append(num, label);
+    btn.addEventListener("click", () => checkChoice(btn, opt, correctVal));
+    box.appendChild(btn);
+  });
+}
+
+/* ----------------------------------------------------------------------
+   4択：選択肢が押されたときの採点
+   ---------------------------------------------------------------------- */
+function checkChoice(btn, selectedVal, correctVal) {
+  if (state.answered) return;          // 二重回答を防ぐ
+  state.answered = true;
+
+  const isCorrect = selectedVal.trim() === correctVal.trim();
+
+  // すべての選択肢を押せなくし、正解には緑、選んだ誤答には赤を付ける
+  $("choices").querySelectorAll(".choice").forEach((b) => {
+    b.disabled = true;
+    if (b.dataset.value.trim() === correctVal.trim()) b.classList.add("is-correct");
+  });
+  if (!isCorrect) btn.classList.add("is-wrong");
+
+  // スコア集計（自己採点モードと同じ変数を共有）
+  if (isCorrect) state.correct++;
+  else state.wrong.push(state.deck[state.index]);
+  updateCounter();
+
+  // 答え（解答＋備考）を表示する。a-text・備考は renderCard で仕込み済み。
+  $("answer-box").hidden = false;
+
+  // 「次へ」を表示してフォーカス（Enterですぐ進める）
+  $("btn-next").hidden = false;
+  $("btn-next").focus();
+}
+
+// 4択：次の問題へ進む（最後まで来たら結果へ）
+function nextCard() {
+  state.index++;
+  if (state.index >= state.deck.length) showResult();
+  else renderCard();
+}
+
+// 「やめる」：回答を中断してスタート画面（ファイル選択）に戻る
+//  ・読み込み済みデータ(allCards)とオプションはそのまま残るので、すぐ再開できる
+function quitQuiz() {
+  $("counter").textContent = "";
+  show("start");
+}
+
+// 進捗カウンター（例： 03 / 20 ・ 正解 2）を更新
+function updateCounter() {
+  const total = state.deck.length;
+  const n = String(state.index + 1).padStart(2, "0");
+  const t = String(total).padStart(2, "0");
+  $("counter").textContent = `${n} / ${t} ・ 正解 ${state.correct}`;
+}
+
+// 「答えを見る」：解答を表示して、○×ボタンに切り替える
+function revealAnswer() {
+  $("answer-box").hidden = false;
+  $("btn-reveal").hidden = true;
+  $("grade").hidden = false;
+}
+
+/* ----------------------------------------------------------------------
+   自己採点（○ または ×）→ 次の問題へ
+   ---------------------------------------------------------------------- */
+function grade(isCorrect) {
+  if (isCorrect) state.correct++;
+  else state.wrong.push(state.deck[state.index]);  // 間違えたカードを記録
+
+  state.index++;
+  if (state.index >= state.deck.length) {
+    showResult();   // 最後まで来たら結果へ
+  } else {
+    renderCard();
+  }
+}
+
+/* ----------------------------------------------------------------------
+   結果表示
+   ---------------------------------------------------------------------- */
+function showResult() {
+  const total = state.deck.length;
+  $("r-score").textContent = `${state.correct} / ${total}`;
+  const pct = total ? Math.round((state.correct / total) * 100) : 0;
+  $("r-sub").textContent =
+    `正答率 ${pct}％ ・ 間違えた問題 ${state.wrong.length}問`;
+
+  // 間違いが無ければ「もう一周」ボタンは無効化
+  $("btn-retry-wrong").disabled = state.wrong.length === 0;
+  $("counter").textContent = "";
+  show("result");
+}
+
+// 間違えた問題だけで、もう一周
+function retryWrong() {
+  state.deck = shuffle(state.wrong);
+  state.index = 0;
+  state.correct = 0;
+  state.wrong = [];
+  show("quiz");
+  renderCard();
+}
+
+// 同じ範囲を最初から（直前のデッキ条件を再構築）
+function restart() {
+  startQuiz();  // オプションは画面に残っているのでそのまま再利用
+}
+
+/* ======================================================================
+   イベント登録（ボタン・ファイル選択・キーボード操作）
+   ====================================================================== */
+
+// ファイル選択
+$("file").addEventListener("change", (e) => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+// ドラッグ&ドロップ
+const drop = $("drop");
+["dragover", "dragenter"].forEach((ev) =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("is-over"); }));
+["dragleave", "drop"].forEach((ev) =>
+  drop.addEventListener(ev, () => drop.classList.remove("is-over")));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+
+// 各ボタン
+$("btn-start").addEventListener("click", startQuiz);
+
+// シャッフルのON/OFFで「何番目から」の表示を切り替え
+//（ON＝ランダムなので開始位置は不要、OFF＝順番なので表示）
+$("sw-shuffle").addEventListener("change", () => {
+  $("start-row").hidden = $("sw-shuffle").checked;
+});
+$("btn-reveal").addEventListener("click", revealAnswer);
+$("btn-ok").addEventListener("click", () => grade(true));
+$("btn-ng").addEventListener("click", () => grade(false));
+$("btn-next").addEventListener("click", nextCard);
+$("btn-quit").addEventListener("click", quitQuiz);
+$("btn-retry-wrong").addEventListener("click", retryWrong);
+$("btn-restart").addEventListener("click", restart);
+$("btn-newfile").addEventListener("click", () => { location.reload(); });
+
+// キーボード操作（PC向け）
+document.addEventListener("keydown", (e) => {
+  if (screens.quiz.hidden) return;
+
+  if (state.mode === "mc") {
+    // 4択：未回答なら 1〜4 で選択、回答後は Enter / Space / → で次へ
+    if (!state.answered) {
+      const n = parseInt(e.key, 10);
+      const buttons = $("choices").querySelectorAll(".choice");
+      if (n >= 1 && n <= buttons.length) { e.preventDefault(); buttons[n - 1].click(); }
+    } else if (e.key === "Enter" || e.code === "Space" || e.key === "ArrowRight") {
+      e.preventDefault(); nextCard();
+    }
+    return;
+  }
+
+  // 自己採点：スペース=答えを見る、O/→=○、X/←=×
+  const revealed = !$("grade").hidden;
+  if (!revealed && e.code === "Space") { e.preventDefault(); revealAnswer(); }
+  else if (revealed) {
+    if (e.key === "o" || e.key === "O" || e.key === "ArrowRight") grade(true);
+    if (e.key === "x" || e.key === "X" || e.key === "ArrowLeft")  grade(false);
+  }
+});
+
+// 起動時はスタート画面
+show("start");
+// 保存済みクイズ一覧を読み込む
+refreshLibrary();
+</script>
+
+<!-- サービスワーカーの登録（オフライン対応の心臓部）。
+     ※file://では動かず、http(s)で配信したときだけ有効になります。 -->
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("./sw.js")
+        .catch((err) => console.warn("Service Worker 登録に失敗:", err));
+    });
+  }
+</script>
+</body>
+</html>
