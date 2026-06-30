@@ -410,7 +410,7 @@
         </div>
 
         <div class="opt-row">
-          <label for="sw-shuffle">問題をシャッフルする</label>
+          <label for="sw-shuffle">ランダム出題（おまかせ順）</label>
           <span class="switch">
             <input type="checkbox" id="sw-shuffle" checked>
             <span class="track"></span>
@@ -676,7 +676,8 @@ async function onParsed(rows, headers, filename) {
   const deck = {
     name, filename: filename || "",
     cards, cols, count: cards.length, createdAt: Date.now(),
-    history: {},   // 問題ごとの直近3回の正誤（キー=行インデックス, 値=[1,0,...]）
+    history: {},     // 問題ごとの直近3回の正誤（キー=行インデックス, 値=[1,0,...]）
+    answeredAt: {},  // 問題ごとの最終回答日時（キー=行インデックス, 値=ミリ秒。未回答はキー無し）
   };
 
   try {
@@ -716,10 +717,15 @@ function selectDeck(deck) {
   state.cols = deck.cols;
   state.currentDeckId = deck.id;
 
-  // 履歴の入れ物を用意し、各カードに行インデックス(idx)を付与。
+  // 履歴・回答日時の入れ物を用意し、各カードに行インデックス(idx)を付与。
   // idx は「デッキ内の並び順」。内容ではなく位置で問題を識別する。
   if (!deck.history) deck.history = {};
-  deck.cards.forEach((c, i) => { c.idx = i; });
+  if (!deck.answeredAt) deck.answeredAt = {};
+  deck.cards.forEach((c, i) => {
+    c.idx = i;
+    // 旧データ移行：履歴はあるが回答日時が無い問題は「ずっと前に回答」とみなす（=古い扱い）
+    if (deck.history[i] && deck.answeredAt[i] == null) deck.answeredAt[i] = 0;
+  });
 
   setupCategoryFilter(deck.cards);
   updateScopeCounts(deck);   // 出題範囲（ミス/うろ覚え）の該当数を表示に反映
@@ -754,10 +760,12 @@ function recordAnswer(idx, isCorrect) {
   const deck = state.currentDeck;
   if (!deck || idx == null) return;
   if (!deck.history) deck.history = {};
+  if (!deck.answeredAt) deck.answeredAt = {};
   const arr = deck.history[idx] ? deck.history[idx].slice() : [];
   arr.push(isCorrect ? 1 : 0);
   while (arr.length > 3) arr.shift();   // 直近3件のみ保持（累積で重くならないように）
   deck.history[idx] = arr;
+  deck.answeredAt[idx] = Date.now();    // 最終回答日時を記録
   persistCurrentDeck();
 }
 
@@ -966,6 +974,27 @@ function shuffle(arr) {
 }
 
 /* ----------------------------------------------------------------------
+   ランダム出題の並び替え（おまかせ順）
+   ・未回答（回答日時なし）を先に出す
+   ・回答済みは「最終回答日時が古い順」（=しばらく解いていないものを優先）
+   ・同条件（未回答どうし／同時刻）はシャッフルして満遍なく
+   ---------------------------------------------------------------------- */
+function smartOrder(cards, deck) {
+  const at = (deck && deck.answeredAt) || {};
+  const unanswered = [];
+  const answered = [];
+  for (const c of cards) {
+    const t = at[c.idx];
+    if (t == null) unanswered.push(c);   // 未回答
+    else answered.push(c);
+  }
+  // 回答済みは、まずシャッフルしてから日時昇順に安定ソート
+  //（同時刻のときはシャッフルされた順＝ランダムが保たれる）
+  const ans = shuffle(answered).sort((a, b) => at[a.idx] - at[b.idx]);
+  return [...shuffle(unanswered), ...ans];
+}
+
+/* ----------------------------------------------------------------------
    出題開始：オプションを読み取り、デッキ（出題対象）を組み立てる
    ---------------------------------------------------------------------- */
 function startQuiz() {
@@ -999,8 +1028,8 @@ function startQuiz() {
   count = Math.min(count, total);
 
   if ($("sw-shuffle").checked) {
-    // ランダム：シャッフルして先頭から count 問
-    deck = shuffle(deck).slice(0, count);
+    // ランダム（おまかせ順）：未回答優先→回答が古い順 で並べて先頭から count 問
+    deck = smartOrder(deck, state.currentDeck).slice(0, count);
   } else {
     // 順番：開始位置（1始まり）から count 問
     let start = parseInt($("num-start").value, 10);
